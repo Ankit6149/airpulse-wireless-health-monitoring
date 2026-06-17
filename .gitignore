@@ -1,0 +1,26 @@
+# Python cache & build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+env/
+venv/
+
+# SQLite databases
+*.db
+*.db-journal
+
+# IDE and System Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Executables in public core
+*.exe
+*.dll
+*.so
+*.dylib
+temp_go/
