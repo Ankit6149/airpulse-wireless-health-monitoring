@@ -24,3 +24,15 @@ Thumbs.db
 *.so
 *.dylib
 temp_go/
+
+# Rust build artifacts
+target/
+**/target/
+build-target/
+**/build-target/
+
+# Mobile dependencies and configuration overrides
+mobile/node_modules/
+mobile/.expo/
+node_modules/
+

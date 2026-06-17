@@ -1,0 +1,20 @@
+namespace airpulse_core {
+  string process_csi_frame(string json_payload);
+  VitalsResult calculate_vitals(sequence<double> raw_signal);
+  PositionResult update_position(double x, double y);
+};
+
+dictionary VitalsResult {
+  double respiration_rate;
+  double heart_rate;
+  double confidence;
+  boolean anomaly_detected;
+};
+
+dictionary PositionResult {
+  double x;
+  double y;
+  double velocity_x;
+  double velocity_y;
+  string current_zone;
+};
