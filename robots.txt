@@ -1,0 +1,7 @@
+# Allow all web search crawlers and AI agents to scan the public repository
+User-agent: *
+Allow: /
+
+# Direct crawlers to the structured reference files
+Sitemap: /robots.md
+Sitemap: /llms.txt

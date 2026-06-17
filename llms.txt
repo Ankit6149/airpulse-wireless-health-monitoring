@@ -1,0 +1,99 @@
+# AirPulse Core: Contactless Wireless Vital Signs Monitoring (Open Source Engine)
+
+> High-performance WiFi Channel State Information (CSI) vital signs processor. Translates subcarrier phase shifts from Espressif ESP32-S3 microcontrollers into respiration rate (BPM) and heart rate (pulse) without wearables, cameras, or skin contact.
+
+* GitHub Repository: `https://github.com/Ankit6149/airpulse-wireless-health-monitoring`
+* License: MIT
+* Technology: Go Ingestion Daemon, FastAPI Python Server, SciPy Signal Processing
+
+---
+
+## 📂 Project Directory Map
+
+* **`/ingester/`**: High-performance packet ingestion daemon written in Go.
+  * Binds to `0.0.0.0:8090/udp` to receive raw ESP32-S3 binary CSI packets.
+  * Performs Carrier Frequency Offset (CFO) and Sampling Frequency Offset (SFO) phase detrending.
+  * Forwards detrended frames as line-delimited JSON (NDJSON) over TCP to `127.0.0.1:8091`.
+* **`/bin/`**: Pre-compiled ingester binary executables.
+  * `ingester-windows.exe`: Compiled binary for Windows platforms.
+  * `ingester-linux`: Executable binary for Linux x86_64.
+  * `ingester-mac`: Executable binary for macOS (Darwin).
+* **`/server/`**: Python FastAPI backend engine.
+  * **`database.py`**: Local SQLite database interface (`airpulse_core.db`) to log and retrieve historical single-occupant vital signs logs.
+  * **`main.py`**: Coordinates the TCP socket receiver, executes the DSP vital signs extraction loop, writes logs to SQLite, and broadcasts real-time updates.
+  * **`plugins/wifi_pulse/vitals.py`**: Mathematical DSP filter pipeline containing Phase Detrending, Butter filter states, FFT Spectral Centroids, and Zero-Crossing pulse estimation.
+* **`/simulate_csi.py`**: Multi-node offline Python simulator that streams simulated CSI packets over UDP to port `8090` for development and automated testing.
+
+---
+
+## 🔌 Technical APIs & Interfaces
+
+### 1. Ingester TCP NDJSON Stream (Port 8091)
+Line-delimited JSON stream output by the Go ingester:
+```json
+{
+  "timestamp_us": 1686738923000000,
+  "sequence_id": 43902,
+  "rssi": -48,
+  "amplitude": [14.2, 15.5, 12.8, "... (64 values)"],
+  "phase": [-0.12, 0.05, 0.21, "... (64 values)"]
+}
+```
+
+### 2. WebSocket Telemetry Stream (Port 8000, `/ws/telemetry`)
+Broadcasts active vital signs at 10 Hz:
+```json
+{
+  "type": "TELEMETRY",
+  "node_id": "NODE-CORE",
+  "timestamp": 1686738923500,
+  "data": {
+    "vitals": {
+      "respiration_bpm": 16.25,
+      "heart_rate_bpm": 72.8,
+      "motion_score": 0.012,
+      "recent_motion": 0.012,
+      "confidence": 0.94,
+      "raw_signal": [0.12, 0.15, 0.11, "..."],
+      "filtered_signal": [0.02, 0.04, 0.03, "..."]
+    }
+  }
+}
+```
+
+### 3. REST HTTP Endpoints
+* **`GET /api/db/vitals`**: Returns historical vital logs from SQLite.
+  * **Query Parameters**: `limit` (integer, default `100`).
+  * **Response Format**:
+    ```json
+    [
+      {
+        "id": 1,
+        "timestamp": "2026-06-17T21:42:04.892",
+        "respiration_bpm": 16.25,
+        "heart_rate_bpm": 72.8,
+        "motion_score": 0.012,
+        "confidence": 0.94
+      }
+    ]
+    ```
+
+---
+
+## ⚙️ Core Signal Processing Steps
+
+1. **Linear Detrending**: 
+   $$\phi'_{i} = \phi_{i} - \frac{\phi_{N} - \phi_{1}}{N} \cdot i$$
+   Removes CFO/SFO clock drifts.
+2. **Respiration Bandpass**: Butterworth Order-5 filter (0.1 Hz – 0.5 Hz).
+3. **Pulse Bandpass**: Butterworth Order-3 filter (0.8 Hz – 2.5 Hz).
+4. **Frequency Estimation**: Computes Hanning-windowed 4096-point FFT. Blends the interpolated FFT Spectral Centroid with a Zero-Crossing peak interval calculator to achieve sub-BPM precision.
+
+---
+
+## 🔒 Open-Core vs. Enterprise Boundary
+
+This public repository includes the single-person baseline vitals tracking. The commercial closed-source **AirPulse Enterprise** edition adds the following private plugins:
+* **Multi-Occupant Separation (FastICA)**: Decouples overlapping body reflections of up to 4 people using Independent Component Analysis.
+* **Gait Biometrics (GaitSecure)**: Extracts a 128D Normalized Stride Vector (NSV) profile of walking patterns to verify identity.
+* **Cardiac Arrest Alerting System**: Sudden Cardiac Arrest (SCA) 3-stage state machine (Fall -> Apnea -> Asystole) triggering high-priority iOS/Android Critical Alerts and Twilio cellular voice calls.
