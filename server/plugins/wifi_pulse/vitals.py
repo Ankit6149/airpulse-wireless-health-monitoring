@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt, find_peaks
 from collections import deque
 import time
 import logging
@@ -122,7 +122,7 @@ class AdaptiveLMSFilter:
 class VitalsProcessorModule(BasePlugin):
     """
     Single-Person Vitals Processor with EMA smoothing, median filtering,
-    spectral centroid interpolation, and confidence scoring.
+    spectral centroid interpolation, confidence scoring, and active motion locks.
     """
 
     EMA_ALPHA = 0.15
@@ -141,8 +141,10 @@ class VitalsProcessorModule(BasePlugin):
         # Temporal smoothing state
         self._ema_resp = 0.0
         self._ema_heart = 0.0
+        self._ema_rmssd = 50.0
         self._resp_history = deque(maxlen=self.MEDIAN_WINDOW)
         self._heart_history = deque(maxlen=self.MEDIAN_WINDOW)
+        self._rmssd_history = deque(maxlen=self.MEDIAN_WINDOW)
 
         # Kalman Trackers (1D) for vitals
         self.kf_resp = None
@@ -196,8 +198,10 @@ class VitalsProcessorModule(BasePlugin):
                 self.kf_heart = None
                 self._resp_history.clear()
                 self._heart_history.clear()
+                self._rmssd_history.clear()
                 self._ema_resp = 0.0
                 self._ema_heart = 0.0
+                self._ema_rmssd = 50.0
 
         self.history_amplitudes.append(amplitude)
         self.history_phases.append(phase)
@@ -220,8 +224,10 @@ class VitalsProcessorModule(BasePlugin):
                 "timestamp_ms": int(time.time() * 1000),
                 "respiration_bpm": 0.0,
                 "heart_rate_bpm": 0.0,
+                "hrv_rmssd": 50.0,
                 "motion_score": 0.0,
                 "confidence": 0.0,
+                "status": "Initializing",
                 "raw_signal": [],
                 "filtered_signal": [],
             }
@@ -241,6 +247,9 @@ class VitalsProcessorModule(BasePlugin):
         motion_score = float(np.std(primary_signal))
         recent_motion_score = float(np.std(primary_signal[-40:])) if len(primary_signal) >= 40 else motion_score
 
+        # Active movement check: Vitals Lock
+        is_vitals_locked = recent_motion_score > 8.0
+
         # Apply NLMS filter to primary amplitude signal for heart rate tracking
         min_subcarrier_idx = np.argmin(variances)
         reference_signal = amplitudes[:, min_subcarrier_idx]
@@ -254,12 +263,22 @@ class VitalsProcessorModule(BasePlugin):
 
         # Extract primary breathing and heart rate
         raw_resp, resp_conf = self._extract_respiration_raw(primary_phase_signal)
-        raw_heart, heart_conf = self._extract_heart_rate_raw(denoised_primary_signal)
+        raw_heart, heart_conf, raw_rmssd = self._extract_heart_rate_raw(denoised_primary_signal)
+
+        if is_vitals_locked:
+            raw_resp = self._ema_resp
+            raw_heart = self._ema_heart
+            raw_rmssd = self._ema_rmssd
+            resp_conf = 0.0
+            heart_conf = 0.0
 
         self._resp_history.append(raw_resp)
         self._heart_history.append(raw_heart)
+        self._rmssd_history.append(raw_rmssd)
+        
         median_resp = median_of_deque(self._resp_history)
         median_heart = median_of_deque(self._heart_history)
+        median_rmssd = median_of_deque(self._rmssd_history)
 
         if self.kf_resp is None:
             self.kf_resp = KalmanFilter1D(initial_value=median_resp, process_variance=0.03, measurement_variance=1.5)
@@ -269,7 +288,7 @@ class VitalsProcessorModule(BasePlugin):
         # Normalize confidence metrics
         resp_conf_norm = min(1.0, resp_conf / 0.03)
         heart_conf_norm = min(1.0, heart_conf / 0.015)
-        confidence = 0.7 * resp_conf_norm + 0.3 * heart_conf_norm
+        confidence = 0.7 * resp_conf_norm + 0.3 * heart_conf_norm if not is_vitals_locked else 0.0
 
         smoothed_resp = self.kf_resp.update(median_resp, resp_conf_norm)
         smoothed_heart = self.kf_heart.update(median_heart, heart_conf_norm)
@@ -278,9 +297,9 @@ class VitalsProcessorModule(BasePlugin):
         if self._ema_resp == 0.0:
             self._ema_resp = smoothed_resp
         else:
-            if raw_resp > 0.0:
+            if raw_resp > 0.0 and not is_vitals_locked:
                 self._ema_resp = self.EMA_ALPHA * smoothed_resp + (1.0 - self.EMA_ALPHA) * self._ema_resp
-            else:
+            elif raw_resp <= 0.0:
                 self._ema_resp = 0.9 * self._ema_resp
                 if self._ema_resp < 0.5:
                     self._ema_resp = 0.0
@@ -288,22 +307,32 @@ class VitalsProcessorModule(BasePlugin):
         if self._ema_heart == 0.0:
             self._ema_heart = smoothed_heart
         else:
-            if raw_heart > 0.0:
+            if raw_heart > 0.0 and not is_vitals_locked:
                 self._ema_heart = self.EMA_ALPHA * smoothed_heart + (1.0 - self.EMA_ALPHA) * self._ema_heart
-            else:
+            elif raw_heart <= 0.0:
                 self._ema_heart = 0.9 * self._ema_heart
                 if self._ema_heart < 0.5:
                     self._ema_heart = 0.0
 
+        if self._ema_rmssd == 0.0 or self._ema_rmssd == 50.0:
+            self._ema_rmssd = median_rmssd
+        else:
+            if not is_vitals_locked:
+                self._ema_rmssd = self.EMA_ALPHA * median_rmssd + (1.0 - self.EMA_ALPHA) * self._ema_rmssd
+
         filtered_resp = sosfiltfilt(self._sos_resp, primary_phase_signal)
+
+        status_str = "Patient Active (Vitals Locked)" if is_vitals_locked else "Excellent"
 
         return {
             "timestamp_ms": int(time.time() * 1000),
             "respiration_bpm": round(self._ema_resp, 1),
             "heart_rate_bpm": round(self._ema_heart, 1),
+            "hrv_rmssd": round(self._ema_rmssd, 1),
             "motion_score": round(motion_score, 4),
             "recent_motion": round(recent_motion_score, 4),
             "confidence": round(confidence, 3),
+            "status": status_str,
             "raw_signal": [float(x) for x in primary_phase_signal[-100:]],
             "filtered_signal": [float(x) for x in filtered_resp[-100:]],
         }
@@ -351,12 +380,12 @@ class VitalsProcessorModule(BasePlugin):
             logger.error(f"Error during respiration extraction: {e}")
             raise FilterExecutionError(f"Respiration bandpass filter/FFT failed: {e}")
 
-    def _extract_heart_rate_raw(self, signal: np.ndarray) -> tuple[float, float]:
+    def _extract_heart_rate_raw(self, signal: np.ndarray) -> tuple[float, float, float]:
         try:
             filtered = sosfiltfilt(self._sos_heart, signal)
             std_val = np.std(filtered)
             if std_val < 0.05:
-                return 0.0, 0.0
+                return 0.0, 0.0, 50.0
                 
             centered = filtered - np.mean(filtered)
             L = len(centered)
@@ -369,7 +398,7 @@ class VitalsProcessorModule(BasePlugin):
             mask = self._heart_mask
             
             if not np.any(mask):
-                return 72.0, 0.0
+                return 72.0, 0.0, 50.0
 
             masked_mags = fft_vals[mask]
             peak_local_idx = np.argmax(masked_mags)
@@ -388,7 +417,19 @@ class VitalsProcessorModule(BasePlugin):
             else:
                 bpm = fft_bpm
 
-            return float(np.clip(bpm, 45.0, 140.0)), confidence
+            # Estimate HRV (RMSSD) from peak intervals
+            min_dist = int(0.4 * self.config.sampling_rate) # ~150 BPM max
+            peaks, _ = find_peaks(filtered, distance=min_dist, prominence=0.01)
+            
+            rmssd_ms = 50.0
+            if len(peaks) >= 3:
+                peak_times = peaks / self.config.sampling_rate
+                rr_intervals = np.diff(peak_times)
+                if len(rr_intervals) >= 2:
+                    rmssd_ms = float(np.sqrt(np.mean(np.diff(rr_intervals)**2)) * 1000.0)
+                    rmssd_ms = np.clip(rmssd_ms, 5.0, 150.0)
+
+            return float(np.clip(bpm, 45.0, 140.0)), confidence, rmssd_ms
 
         except Exception as e:
             logger.error(f"Error during BCG heart rate extraction: {e}")
